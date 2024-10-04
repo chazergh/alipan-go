@@ -1,15 +1,29 @@
 package common
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
+var sleepTimes int
+var mu sync.Mutex
+
 func DoRequest[R any](l AccessTokenLoader, c *http.Client, req *http.Request) (*R, error) {
+	if sleepTimes > 0 {
+		mu.Lock()
+		sleepTimes = 0
+		mu.Unlock()
+	}
+
 	if l != nil {
 		token, err := l.LoadAccessToken()
 		if err != nil {
@@ -17,6 +31,17 @@ func DoRequest[R any](l AccessTokenLoader, c *http.Client, req *http.Request) (*
 		}
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %v", *token))
 	}
+
+	var reqBodyBytes []byte
+	if req.Body != nil {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		reqBodyBytes = body
+		req.Body = io.NopCloser(bytes.NewReader(reqBodyBytes))
+	}
+
 	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
@@ -32,10 +57,29 @@ func DoRequest[R any](l AccessTokenLoader, c *http.Client, req *http.Request) (*
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf(
-			"http status code: %v  | http response body: %v",
-			resp.StatusCode, string(buff),
-		)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			xRetryAfter, err := strconv.Atoi(resp.Header.Get("x-retry-after"))
+			if err != nil {
+				return nil, err
+			}
+
+			log.Println(req.URL.Path, "x-retry-after", xRetryAfter)
+
+			mu.Lock()
+			sleepTimes = xRetryAfter
+			time.Sleep(time.Duration(sleepTimes) * time.Millisecond)
+			mu.Unlock()
+
+			if reqBodyBytes != nil {
+				req.Body = io.NopCloser(bytes.NewReader(reqBodyBytes))
+			}
+			return DoRequest[R](l, c, req)
+		} else {
+			return nil, fmt.Errorf(
+				"http status code: %v | http response body: %v",
+				resp.StatusCode, string(buff),
+			)
+		}
 	}
 	var result R
 	err = json.Unmarshal(buff, &result)
